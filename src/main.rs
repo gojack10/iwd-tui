@@ -1,18 +1,21 @@
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use dbus::blocking::Connection;
+use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     symbols::border,
     text::{Line, Span},
     widgets::{Block, Paragraph},
-    Frame,
 };
 
 const POLL_MS: u64 = 100;
+const STATUS_POLL_MS: u64 = 300;
 const REFRESH_SECS: u64 = 2;
 const MAX_SSID: usize = 20;
 const MAX_BLOCKS: usize = 10;
@@ -34,7 +37,17 @@ const IWD_NETWORK: &str = "net.connman.iwd.Network";
 const IWD_DEVICE: &str = "net.connman.iwd.Device";
 const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
 
+enum ActionResult {
+    Scan(Result<(), String>),
+    Connect {
+        path: String,
+        result: Result<(), String>,
+    },
+    Disconnect(Result<(), String>),
+}
+
 struct Network {
+    path: String,
     name: String,
     net_type: String,
     signal_dbm: i16,
@@ -48,37 +61,48 @@ struct App {
     station_path: String,
     interface_name: String,
     state: String,
+    pending_connect_path: Option<String>,
+    scanning: bool,
+    scan_started_at: Option<Instant>,
+    header_error: Option<String>,
+    action_tx: mpsc::Sender<ActionResult>,
+    action_rx: mpsc::Receiver<ActionResult>,
     conn: Connection,
     should_quit: bool,
 }
 
 impl App {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let conn =
-            Connection::new_system().map_err(|_| "Failed to connect to system D-Bus")?;
+        let conn = Connection::new_system().map_err(|_| "Failed to connect to system D-Bus")?;
         let (station_path, interface_name) = find_station(&conn)?;
         let proxy = conn.with_proxy(IWD_BUS, &*station_path, DBUS_TIMEOUT);
         let state: String = proxy.get(IWD_STATION, "State")?;
 
+        let (action_tx, action_rx) = mpsc::channel();
         let mut app = App {
             networks: Vec::new(),
             selected: 0,
             station_path,
             interface_name,
             state: state.to_uppercase(),
+            pending_connect_path: None,
+            scanning: false,
+            scan_started_at: None,
+            header_error: None,
+            action_tx,
+            action_rx,
             conn,
             should_quit: false,
         };
+        app.refresh_runtime_state()?;
         app.refresh_networks()?;
         Ok(app)
     }
 
     fn refresh_networks(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let proxy = self.conn.with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
-        self.state = proxy
-            .get::<String>(IWD_STATION, "State")?
-            .to_uppercase();
-
+        let proxy = self
+            .conn
+            .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
         let (ordered,): (Vec<(dbus::Path<'static>, i16)>,) =
             proxy.method_call(IWD_STATION, "GetOrderedNetworks", ())?;
 
@@ -93,6 +117,7 @@ impl App {
                 .is_ok();
 
             networks.push(Network {
+                path: path.to_string(),
                 name,
                 net_type,
                 signal_dbm: signal / 100,
@@ -114,7 +139,128 @@ impl App {
         if !self.networks.is_empty() {
             self.selected = self.selected.min(self.networks.len() - 1);
         }
+        self.reconcile_pending_connect();
         Ok(())
+    }
+
+    fn refresh_runtime_state(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let proxy = self
+            .conn
+            .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
+        self.state = proxy.get::<String>(IWD_STATION, "State")?.to_uppercase();
+
+        let scanning = proxy.get::<bool>(IWD_STATION, "Scanning")?;
+        if scanning && !self.scanning {
+            self.scan_started_at = Some(Instant::now());
+        }
+
+        let scan_finished = self.scanning && !scanning;
+        self.scanning = scanning;
+
+        if scan_finished {
+            self.scan_started_at = None;
+            self.refresh_networks()?;
+        }
+
+        self.reconcile_pending_connect();
+
+        Ok(())
+    }
+
+    fn set_error(&mut self, error: impl ToString) {
+        self.header_error = Some(condense_error(&error.to_string()));
+    }
+
+    fn clear_action_error(&mut self) {
+        self.header_error = None;
+    }
+
+    fn selected_network(&self) -> Option<&Network> {
+        self.networks.get(self.selected)
+    }
+
+    fn reconcile_pending_connect(&mut self) {
+        let Some(path) = self.pending_connect_path.as_deref() else {
+            return;
+        };
+
+        let target_connected = self
+            .networks
+            .iter()
+            .any(|network| network.path == path && network.connected);
+
+        if target_connected || self.state != "CONNECTING" {
+            self.pending_connect_path = None;
+        }
+    }
+
+    fn connect_is_idempotent_noop(&self, network: &Network) -> bool {
+        network.connected || self.pending_connect_path.as_deref() == Some(network.path.as_str())
+    }
+
+    fn scan(&mut self) {
+        let tx = self.action_tx.clone();
+        let station_path = self.station_path.clone();
+        thread::spawn(move || {
+            let result = dbus_call(&station_path, IWD_STATION, "Scan");
+            let _ = tx.send(ActionResult::Scan(result));
+        });
+    }
+
+    fn connect_selected(&mut self) -> Result<(), String> {
+        let Some(network) = self.selected_network() else {
+            return Err("No network selected".into());
+        };
+        let network_path = network.path.clone();
+        let network_type = network.net_type.clone();
+        let network_known = network.known;
+
+        if self.connect_is_idempotent_noop(network) {
+            return Ok(());
+        }
+
+        if !network_known && network_type != "open" {
+            return Err("Password required; T3 overlay not built yet".into());
+        }
+
+        self.pending_connect_path = Some(network_path.clone());
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let result = dbus_call(&network_path, IWD_NETWORK, "Connect");
+            let _ = tx.send(ActionResult::Connect {
+                path: network_path,
+                result,
+            });
+        });
+        Ok(())
+    }
+
+    fn disconnect(&mut self) {
+        let tx = self.action_tx.clone();
+        let station_path = self.station_path.clone();
+        thread::spawn(move || {
+            let result = dbus_call(&station_path, IWD_STATION, "Disconnect");
+            let _ = tx.send(ActionResult::Disconnect(result));
+        });
+    }
+
+    fn drain_action_results(&mut self) {
+        while let Ok(result) = self.action_rx.try_recv() {
+            match result {
+                ActionResult::Scan(Err(e)) => self.set_error(e),
+                ActionResult::Connect {
+                    path,
+                    result: Err(e),
+                } => {
+                    if self.pending_connect_path.as_deref() == Some(&path) {
+                        self.pending_connect_path = None;
+                    }
+                    self.set_error(e);
+                }
+                ActionResult::Disconnect(Err(e)) => self.set_error(e),
+                _ => {}
+            }
+        }
     }
 
     fn handle_key(&mut self, code: KeyCode) {
@@ -128,9 +274,32 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
             }
+            KeyCode::Char('s') => {
+                self.clear_action_error();
+                self.scan();
+            }
+            KeyCode::Enter => {
+                self.clear_action_error();
+                if let Err(error) = self.connect_selected() {
+                    self.set_error(error);
+                }
+            }
+            KeyCode::Char('d') => {
+                self.clear_action_error();
+                self.disconnect();
+            }
             _ => {}
         }
     }
+}
+
+fn dbus_call(path: &str, interface: &str, method: &str) -> Result<(), String> {
+    let conn = Connection::new_system().map_err(|e| e.to_string())?;
+    let proxy = conn.with_proxy(IWD_BUS, path, DBUS_TIMEOUT);
+    let _: () = proxy
+        .method_call(interface, method, ())
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn find_station(conn: &Connection) -> Result<(String, String), Box<dyn std::error::Error>> {
@@ -189,6 +358,30 @@ fn dbm_color(dbm: i16) -> Color {
     }
 }
 
+fn condense_error(error: &str) -> String {
+    error
+        .rsplit(": ")
+        .next()
+        .unwrap_or(error)
+        .trim()
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn header_state(app: &App) -> String {
+    if let Some(error) = &app.header_error {
+        return format!("FAILED: {error}");
+    }
+
+    if app.scanning {
+        let start = app.scan_started_at.unwrap_or_else(Instant::now);
+        let phase = ((start.elapsed().as_millis() / 300) % 3 + 1) as usize;
+        return format!("SCANNING{}", ".".repeat(phase));
+    }
+
+    app.state.clone()
+}
+
 fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
@@ -201,15 +394,13 @@ fn ui(f: &mut Frame, app: &App) {
     render_list(f, chunks[1], app);
 
     f.render_widget(
-        Paragraph::new(
-            " j/k:move  enter:connect  d:disconnect  f:forget  s:scan  a:autoconnect",
-        ),
+        Paragraph::new(" j/k:move  enter:connect  d:disconnect  f:forget  s:scan  a:autoconnect"),
         chunks[2],
     );
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    let left = format!(" iwd -- {} -- {}", app.interface_name, app.state);
+    let left = format!(" iwd -- {} -- {}", app.interface_name, header_state(app));
     let right = "esc:quit ";
     let gap = (area.width as usize).saturating_sub(left.len() + right.len());
     let header = Line::from(vec![
@@ -251,11 +442,7 @@ fn render_list(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw(format!("   {:<5} {}", net.net_type, status)),
             ]);
 
-            if i == app.selected {
-                line
-            } else {
-                line
-            }
+            line
         })
         .collect();
 
@@ -278,6 +465,7 @@ fn main() {
     };
 
     let mut terminal = ratatui::init();
+    terminal.clear().unwrap();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
 
@@ -292,6 +480,7 @@ fn run(
     app: &mut App,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_refresh = Instant::now();
+    let mut last_status_refresh = Instant::now();
 
     loop {
         terminal.draw(|f| ui(f, app))?;
@@ -308,7 +497,15 @@ fn run(
             return Ok(());
         }
 
+        app.drain_action_results();
+
+        if last_status_refresh.elapsed() >= Duration::from_millis(STATUS_POLL_MS) {
+            let _ = app.refresh_runtime_state();
+            last_status_refresh = Instant::now();
+        }
+
         if last_refresh.elapsed() >= Duration::from_secs(REFRESH_SECS) {
+            let _ = app.refresh_runtime_state();
             let _ = app.refresh_networks();
             last_refresh = Instant::now();
         }
