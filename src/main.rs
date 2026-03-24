@@ -5,7 +5,7 @@ use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use dbus::blocking::Connection;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     symbols::border,
     text::{Line, Span},
     widgets::{Block, Paragraph},
@@ -252,14 +252,20 @@ fn render_list(f: &mut Frame, area: Rect, app: &App) {
             ]);
 
             if i == app.selected {
-                line.style(Style::default().add_modifier(Modifier::REVERSED))
+                line
             } else {
                 line
             }
         })
         .collect();
 
-    f.render_widget(Paragraph::new(lines), inner);
+    let visible = inner.height as usize;
+    let offset = if app.selected >= visible {
+        app.selected - visible + 1
+    } else {
+        0
+    };
+    f.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
 }
 
 fn main() {
