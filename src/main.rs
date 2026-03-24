@@ -126,18 +126,19 @@ impl App {
             });
         }
 
-        // Sort: connected first, then known by signal desc, then unknown by signal desc
-        networks.sort_by(|a, b| {
-            a.connected
-                .cmp(&b.connected)
-                .reverse()
-                .then(a.known.cmp(&b.known).reverse())
-                .then(b.signal_dbm.cmp(&a.signal_dbm))
-        });
+        // Sort by signal strength only (strongest first)
+        networks.sort_by(|a, b| b.signal_dbm.cmp(&a.signal_dbm));
 
+        let prev_path = self.networks.get(self.selected).map(|n| n.path.clone());
         self.networks = networks;
-        if !self.networks.is_empty() {
-            self.selected = self.selected.min(self.networks.len() - 1);
+        if let Some(ref p) = prev_path {
+            if let Some(idx) = self.networks.iter().position(|n| n.path == *p) {
+                self.selected = idx;
+            } else {
+                self.selected = self.selected.min(self.networks.len().saturating_sub(1));
+            }
+        } else {
+            self.selected = self.selected.min(self.networks.len().saturating_sub(1));
         }
         self.reconcile_pending_connect();
         Ok(())
@@ -195,7 +196,7 @@ impl App {
     }
 
     fn connect_is_idempotent_noop(&self, network: &Network) -> bool {
-        network.connected || self.pending_connect_path.as_deref() == Some(network.path.as_str())
+        network.connected || self.pending_connect_path.is_some()
     }
 
     fn scan(&mut self) {
@@ -275,6 +276,9 @@ impl App {
                 self.selected = self.selected.saturating_sub(1);
             }
             KeyCode::Char('s') => {
+                if self.scanning {
+                    return;
+                }
                 self.clear_action_error();
                 self.scan();
             }
