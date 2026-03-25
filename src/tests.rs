@@ -32,7 +32,7 @@ fn test_app(networks: Vec<Network>, state: &str) -> App {
         header_error: None,
         action_tx: tx,
         action_rx: rx,
-        conn: Connection::new_system().unwrap(),
+        conn: Connection::system().unwrap(),
         should_quit: false,
         diagnostics: None,
         connected_since: None,

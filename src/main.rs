@@ -1,27 +1,24 @@
 #![warn(clippy::pedantic)]
 
 macro_rules! log {
-    ($($arg:tt)*) => {
-        eprintln!("[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), format!($($arg)*))
-    };
+    ($($arg:tt)*) => {{
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = d.as_secs();
+        eprintln!("[{:02}:{:02}:{:02}.{:03}] {}",
+            (secs / 3600) % 24, (secs / 60) % 60, secs % 60,
+            d.subsec_millis(), format!($($arg)*))
+    }};
 }
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use dbus::Message;
-use dbus::arg::{RefArg, Variant};
-
-type DbusProperties = HashMap<String, Variant<Box<dyn RefArg + 'static>>>;
-use dbus::blocking::Connection;
-use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
-use dbus::channel::{MatchingReceiver, Sender};
-use dbus::message::MatchRule;
-use dbus_crossroads::Crossroads;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -30,6 +27,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
+use zbus::blocking::Connection;
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
 const POLL_MS: u64 = 100;
 const STATUS_POLL_MS: u64 = 300;
@@ -55,9 +54,10 @@ const IWD_DEVICE: &str = "net.connman.iwd.Device";
 const IWD_KNOWN_NETWORK: &str = "net.connman.iwd.KnownNetwork";
 const IWD_AGENT_MANAGER: &str = "net.connman.iwd.AgentManager";
 const AGENT_PATH: &str = "/iwdtui/agent";
-const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
 const IWD_STATION_DIAG: &str = "net.connman.iwd.StationDiagnostic";
 const DETAIL_MIN_WIDTH: u16 = 100;
+
+type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
 
 enum ActionResult {
     Scan(Result<(), String>),
@@ -140,10 +140,9 @@ struct App {
 
 impl App {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let conn = Connection::new_system().map_err(|_| "Failed to connect to system D-Bus")?;
+        let conn = Connection::system().map_err(|_| "Failed to connect to system D-Bus")?;
         let (station_path, interface_name) = find_station(&conn)?;
-        let proxy = conn.with_proxy(IWD_BUS, &*station_path, DBUS_TIMEOUT);
-        let state: String = proxy.get(IWD_STATION, "State")?;
+        let state: String = iwd_proxy(&conn, &station_path, IWD_STATION)?.get_property("State")?;
 
         let (action_tx, action_rx) = mpsc::channel();
         let mut app = App {
@@ -176,20 +175,18 @@ impl App {
     }
 
     fn refresh_networks(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let proxy = self
-            .conn
-            .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
-        let (ordered,): (Vec<(dbus::Path<'static>, i16)>,) =
-            proxy.method_call(IWD_STATION, "GetOrderedNetworks", ())?;
+        let proxy = iwd_proxy(&self.conn, &self.station_path, IWD_STATION)?;
+        let reply = proxy.call_method("GetOrderedNetworks", &())?;
+        let ordered: Vec<(OwnedObjectPath, i16)> = reply.body().deserialize()?;
 
         let mut networks = Vec::with_capacity(ordered.len());
         for (path, signal) in ordered {
-            let np = self.conn.with_proxy(IWD_BUS, &*path, DBUS_TIMEOUT);
-            let name: String = np.get(IWD_NETWORK, "Name")?;
-            let net_type: String = np.get(IWD_NETWORK, "Type")?;
-            let connected: bool = np.get(IWD_NETWORK, "Connected")?;
-            let known_path = np
-                .get::<dbus::Path<'static>>(IWD_NETWORK, "KnownNetwork")
+            let np = iwd_proxy(&self.conn, path.as_str(), IWD_NETWORK)?;
+            let name: String = np.get_property("Name")?;
+            let net_type: String = np.get_property("Type")?;
+            let connected: bool = np.get_property("Connected")?;
+            let known_path: Option<String> = np
+                .get_property::<OwnedObjectPath>("KnownNetwork")
                 .ok()
                 .map(|p| p.to_string());
 
@@ -223,22 +220,16 @@ impl App {
 
     fn refresh_runtime_state(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let prev_state = self.state.clone();
-        let state: String = {
-            let proxy = self
-                .conn
-                .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
-            if let Ok(s) = proxy.get(IWD_STATION, "State") {
-                s
-            } else {
-                // Station path stale — re-discover (IWD may have restarted)
-                let (new_path, new_name) = find_station(&self.conn)?;
-                self.station_path = new_path;
-                self.interface_name = new_name;
-                let proxy = self
-                    .conn
-                    .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
-                proxy.get(IWD_STATION, "State")?
-            }
+        let state: String = if let Ok(s) = iwd_proxy(&self.conn, &self.station_path, IWD_STATION)
+            .and_then(|p| p.get_property("State"))
+        {
+            s
+        } else {
+            // Station path stale — re-discover (IWD may have restarted)
+            let (new_path, new_name) = find_station(&self.conn)?;
+            self.station_path = new_path;
+            self.interface_name = new_name;
+            iwd_proxy(&self.conn, &self.station_path, IWD_STATION)?.get_property("State")?
         };
         self.state = state.to_uppercase();
 
@@ -248,10 +239,8 @@ impl App {
             self.connected_since = None;
         }
 
-        let proxy = self
-            .conn
-            .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
-        let scanning = proxy.get::<bool>(IWD_STATION, "Scanning")?;
+        let scanning: bool =
+            iwd_proxy(&self.conn, &self.station_path, IWD_STATION)?.get_property("Scanning")?;
         if scanning && !self.scanning {
             self.scan_started_at = Some(Instant::now());
         }
@@ -271,36 +260,27 @@ impl App {
 
     fn refresh_diagnostics(&mut self) {
         if self.state == "CONNECTED" {
-            let proxy = self
-                .conn
-                .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
-            let result: Result<(DbusProperties,), _> =
-                proxy.method_call(IWD_STATION_DIAG, "GetDiagnostics", ());
-            self.diagnostics = match result {
-                Ok((diag,)) => Some(Diagnostics {
-                    rssi: diag
-                        .get("RSSI")
-                        .and_then(|v| v.0.as_i64())
-                        .map(|v| i16::try_from(v).unwrap_or(i16::MIN)),
-                    frequency: diag
-                        .get("Frequency")
-                        .and_then(|v| v.0.as_u64())
-                        .map(|v| u32::try_from(v).unwrap_or(0)),
-                    tx_bitrate: diag
-                        .get("TxBitrate")
-                        .and_then(|v| v.0.as_u64())
-                        .map(|v| u32::try_from(v).unwrap_or(0)),
-                    rx_bitrate: diag
-                        .get("RxBitrate")
-                        .and_then(|v| v.0.as_u64())
-                        .map(|v| u32::try_from(v).unwrap_or(0)),
-                    security: diag
-                        .get("Security")
-                        .and_then(|v| v.0.as_str())
-                        .map(String::from),
-                }),
-                Err(_) => None,
-            };
+            self.diagnostics = iwd_proxy(&self.conn, &self.station_path, IWD_STATION_DIAG)
+                .and_then(|proxy| proxy.call_method("GetDiagnostics", &()))
+                .ok()
+                .and_then(|reply| {
+                    let diag: HashMap<String, OwnedValue> = reply.body().deserialize().ok()?;
+                    Some(Diagnostics {
+                        rssi: diag.get("RSSI").and_then(|v| i16::try_from(v.clone()).ok()),
+                        frequency: diag
+                            .get("Frequency")
+                            .and_then(|v| u32::try_from(v.clone()).ok()),
+                        tx_bitrate: diag
+                            .get("TxBitrate")
+                            .and_then(|v| u32::try_from(v.clone()).ok()),
+                        rx_bitrate: diag
+                            .get("RxBitrate")
+                            .and_then(|v| u32::try_from(v.clone()).ok()),
+                        security: diag
+                            .get("Security")
+                            .and_then(|v| String::try_from(v.clone()).ok()),
+                    })
+                });
         } else {
             self.diagnostics = None;
         }
@@ -321,8 +301,9 @@ impl App {
             .get(self.selected)
             .and_then(|n| n.known_path.clone());
         self.detail_autoconnect = known_path.and_then(|kp| {
-            let proxy = self.conn.with_proxy(IWD_BUS, &*kp, DBUS_TIMEOUT);
-            proxy.get::<bool>(IWD_KNOWN_NETWORK, "AutoConnect").ok()
+            iwd_proxy(&self.conn, &kp, IWD_KNOWN_NETWORK)
+                .and_then(|p| p.get_property("AutoConnect"))
+                .ok()
         });
 
         // IPv4 (connected only, cached until disconnect)
@@ -533,13 +514,14 @@ impl App {
         let tx = self.action_tx.clone();
         thread::spawn(move || {
             let result = (|| -> Result<(), String> {
-                let conn = Connection::new_system().map_err(|e| e.to_string())?;
-                let proxy = conn.with_proxy(IWD_BUS, &*known_path, DBUS_TIMEOUT);
+                let conn = Connection::system().map_err(|e| e.to_string())?;
+                let proxy =
+                    iwd_proxy(&conn, &known_path, IWD_KNOWN_NETWORK).map_err(|e| e.to_string())?;
                 let current: bool = proxy
-                    .get(IWD_KNOWN_NETWORK, "AutoConnect")
+                    .get_property("AutoConnect")
                     .map_err(|e| e.to_string())?;
                 proxy
-                    .set(IWD_KNOWN_NETWORK, "AutoConnect", !current)
+                    .set_property("AutoConnect", !current)
                     .map_err(|e| e.to_string())?;
                 Ok(())
             })();
@@ -660,12 +642,29 @@ impl App {
     }
 }
 
+fn iwd_proxy(
+    conn: &Connection,
+    path: &str,
+    iface: &str,
+) -> Result<zbus::blocking::Proxy<'static>, zbus::Error> {
+    zbus::blocking::Proxy::new_owned(conn.clone(), IWD_BUS, path.to_owned(), iface.to_owned())
+}
+
+fn get_managed_objects(conn: &Connection) -> Result<ManagedObjects, zbus::Error> {
+    let proxy = zbus::blocking::Proxy::new_owned(
+        conn.clone(),
+        IWD_BUS,
+        "/".to_owned(),
+        "org.freedesktop.DBus.ObjectManager".to_owned(),
+    )?;
+    let reply = proxy.call_method("GetManagedObjects", &())?;
+    reply.body().deserialize()
+}
+
 fn dbus_call(path: &str, interface: &str, method: &str) -> Result<(), String> {
-    let conn = Connection::new_system().map_err(|e| e.to_string())?;
-    let proxy = conn.with_proxy(IWD_BUS, path, DBUS_TIMEOUT);
-    let _: () = proxy
-        .method_call(interface, method, ())
-        .map_err(|e| e.to_string())?;
+    let conn = Connection::system().map_err(|e| e.to_string())?;
+    let proxy = iwd_proxy(&conn, path, interface).map_err(|e| e.to_string())?;
+    proxy.call_method(method, &()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -690,76 +689,37 @@ fn agent_connect(network_path: &str, password: &str) -> Result<(), String> {
     agent_connect_once(&new_path, password)
 }
 
-/// Register a D-Bus agent that responds to IWD passphrase requests,
-/// and install a message receiver that routes calls to it.
-fn setup_agent_receiver(
-    conn: &Connection,
-    password: &str,
-    connect_err: &Arc<Mutex<Option<String>>>,
-) {
-    let mut cr = Crossroads::new();
-    let iface_token = cr.register("net.connman.iwd.Agent", |b| {
-        b.method(
-            "RequestPassphrase",
-            ("network",),
-            ("passphrase",),
-            |_, password: &mut String, (_network,): (dbus::Path<'static>,)| {
-                log!("agent: RequestPassphrase called");
-                Ok((password.clone(),))
-            },
-        );
-        b.method("Cancel", ("reason",), (), |_, _, (reason,): (String,)| {
-            log!("agent: Cancel: {reason}");
-            Ok(())
-        });
-        b.method("Release", (), (), |_, _, ()| {
-            log!("agent: Release called");
-            Ok(())
-        });
-    });
-    cr.insert(AGENT_PATH, &[iface_token], password.to_string());
+struct IwdAgent {
+    password: String,
+}
 
-    let ce = connect_err.clone();
-    conn.start_receive(
-        MatchRule::new(),
-        Box::new(move |mut msg, conn| {
-            if msg.msg_type() == dbus::MessageType::Error {
-                let err_name = msg
-                    .as_result()
-                    .err()
-                    .and_then(|e| e.name().map(String::from));
-                log!(
-                    "agent: recv Error name={:?} items={:?}",
-                    err_name,
-                    msg.get_items()
-                );
-                *ce.lock().unwrap() = err_name;
-            } else {
-                log!(
-                    "agent: recv {:?} member={:?} path={:?} items={:?}",
-                    msg.msg_type(),
-                    msg.member(),
-                    msg.path(),
-                    msg.get_items()
-                );
-                if msg.msg_type() == dbus::MessageType::MethodCall {
-                    cr.handle_message(msg, conn).unwrap();
-                }
-            }
-            true
-        }),
-    );
+#[allow(clippy::unused_self)]
+#[zbus::interface(name = "net.connman.iwd.Agent")]
+impl IwdAgent {
+    #[allow(unused_variables, clippy::needless_pass_by_value)]
+    fn request_passphrase(&self, network: ObjectPath<'_>) -> String {
+        log!("agent: RequestPassphrase called");
+        self.password.clone()
+    }
+
+    fn cancel(&self, reason: &str) {
+        log!("agent: Cancel: {reason}");
+    }
+
+    fn release(&self) {
+        log!("agent: Release called");
+    }
 }
 
 /// If the station is not disconnected, send Disconnect and poll until it is.
-fn disconnect_if_needed(station_proxy: &dbus::blocking::Proxy<'_, &Connection>) {
-    let state: String = station_proxy.get(IWD_STATION, "State").unwrap_or_default();
+fn disconnect_if_needed(proxy: &zbus::blocking::Proxy<'static>) {
+    let state: String = proxy.get_property("State").unwrap_or_default();
     if state != "disconnected" {
         log!("agent_connect: disconnecting (state={state})");
-        let _: Result<(), _> = station_proxy.method_call(IWD_STATION, "Disconnect", ());
+        let _ = proxy.call_method("Disconnect", &());
         for i in 0..20 {
             thread::sleep(Duration::from_millis(50));
-            let s: String = station_proxy.get(IWD_STATION, "State").unwrap_or_default();
+            let s: String = proxy.get_property("State").unwrap_or_default();
             if s == "disconnected" {
                 log!("agent_connect: disconnected after {i} polls");
                 break;
@@ -770,120 +730,59 @@ fn disconnect_if_needed(station_proxy: &dbus::blocking::Proxy<'_, &Connection>) 
 
 fn agent_connect_once(network_path: &str, password: &str) -> Result<(), String> {
     log!("agent_connect: opening system bus");
-    let conn = Connection::new_system().map_err(|e| e.to_string())?;
+    let conn = Connection::system().map_err(|e| e.to_string())?;
 
-    let connect_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    setup_agent_receiver(&conn, password, &connect_err);
+    // Serve the agent on this connection's object server
+    conn.object_server()
+        .at(
+            AGENT_PATH,
+            IwdAgent {
+                password: password.to_string(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
 
     // Find station and set up proxies
     let station_path = find_station_path(&conn).map_err(|e| e.to_string())?;
-    let station_proxy = conn.with_proxy(IWD_BUS, &*station_path, DBUS_TIMEOUT);
-    let mgr_proxy = conn.with_proxy(IWD_BUS, "/net/connman/iwd", DBUS_TIMEOUT);
+    let station_proxy = iwd_proxy(&conn, &station_path, IWD_STATION).map_err(|e| e.to_string())?;
+    let mgr_proxy =
+        iwd_proxy(&conn, "/net/connman/iwd", IWD_AGENT_MANAGER).map_err(|e| e.to_string())?;
 
     disconnect_if_needed(&station_proxy);
 
     // Clear stale agent from previous crash, then register fresh
-    let _ = mgr_proxy.method_call::<(), _, _, _>(
-        IWD_AGENT_MANAGER,
-        "UnregisterAgent",
-        (dbus::Path::from(AGENT_PATH),),
-    );
+    let agent_path = ObjectPath::try_from(AGENT_PATH).expect("constant is valid");
+    let _ = mgr_proxy.call_method("UnregisterAgent", &(&agent_path,));
 
     log!("agent_connect: registering agent at {AGENT_PATH}");
-    let _: () = mgr_proxy
-        .method_call(
-            IWD_AGENT_MANAGER,
-            "RegisterAgent",
-            (dbus::Path::from(AGENT_PATH),),
-        )
+    mgr_proxy
+        .call_method("RegisterAgent", &(&agent_path,))
         .map_err(|e| e.to_string())?;
 
-    // Non-blocking Connect — process() will dispatch RequestPassphrase to crossroads
+    // Connect — blocks while zbus dispatches RequestPassphrase internally
     log!("agent_connect: sending Connect on {network_path}");
-    let msg = Message::new_method_call(IWD_BUS, network_path, IWD_NETWORK, "Connect")?;
-    conn.send(msg).map_err(|()| "Failed to send Connect")?;
+    let net_proxy = iwd_proxy(&conn, network_path, IWD_NETWORK).map_err(|e| e.to_string())?;
+    let result = net_proxy.call_method("Connect", &());
 
-    // Flush outgoing queue to ensure Connect is actually on the wire
-    let _ = conn.channel().read_write(Some(Duration::from_millis(0)));
-    log!("agent_connect: Connect flushed");
+    // Always unregister agent and clean up
+    let _ = mgr_proxy.call_method("UnregisterAgent", &(&agent_path,));
+    let _ = conn.object_server().remove::<IwdAgent, _>(AGENT_PATH);
 
-    // Pump messages until connected, failed, or timed out
-    let target_proxy = conn.with_proxy(IWD_BUS, network_path, DBUS_TIMEOUT);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let started = Instant::now();
-    let grace = Duration::from_secs(5);
-    let mut seen_connecting = false;
-
-    let result = loop {
-        // Drain all pending messages — dispatches RequestPassphrase to crossroads
-        // Must happen BEFORE blocking proxy.get() calls which could eat messages
-        let mut drained = 0u32;
-        loop {
-            match conn.process(Duration::from_millis(0)) {
-                Ok(true) => {
-                    drained += 1;
-                }
-                Ok(false) => break,
-                Err(e) => {
-                    let _ = mgr_proxy.method_call::<(), _, _, _>(
-                        IWD_AGENT_MANAGER,
-                        "UnregisterAgent",
-                        (dbus::Path::from(AGENT_PATH),),
-                    );
-                    return Err(format!("D-Bus error: {e}"));
-                }
-            }
-        }
-        if drained > 0 {
-            log!("agent_connect: drained {drained} messages");
-        }
-
-        // Check if Connect returned an error (set by start_receive handler)
-        if let Some(err) = connect_err.lock().unwrap().take() {
-            if err.contains("InProgress") {
-                log!("agent_connect: InProgress — stale agent_request on network");
-                break Err("InProgress".into());
-            }
-            let label = err.rsplit('.').next().unwrap_or(&err).to_string();
-            log!("agent_connect: Connect error: {err}");
-            break Err(label);
-        }
-
-        let connected: bool = target_proxy.get(IWD_NETWORK, "Connected").unwrap_or(false);
-        if connected {
+    match result {
+        Ok(_) => {
             log!("agent_connect: success");
-            break Ok(());
+            Ok(())
         }
-
-        let state: String = station_proxy.get(IWD_STATION, "State").unwrap_or_default();
-
-        if state == "connecting" && !seen_connecting {
-            log!("agent_connect: state=connecting");
-            seen_connecting = true;
+        Err(e) => {
+            let err_str = e.to_string();
+            log!("agent_connect: Connect error: {err_str}");
+            if err_str.contains("InProgress") {
+                Err("InProgress".into())
+            } else {
+                Err(condense_error(&err_str))
+            }
         }
-
-        if state == "disconnected" && (seen_connecting || started.elapsed() > grace) {
-            log!("agent_connect: failed (seen_connecting={seen_connecting})");
-            break Err("Connection failed".into());
-        }
-
-        if Instant::now() >= deadline {
-            log!("agent_connect: timed out");
-            break Err("Connection timed out".into());
-        }
-
-        // Wait for new messages (blocking read, up to 250ms)
-        let _ = conn.process(Duration::from_millis(250));
-    };
-
-    // Always unregister agent
-    let _ = mgr_proxy.method_call::<(), _, _, _>(
-        IWD_AGENT_MANAGER,
-        "UnregisterAgent",
-        (dbus::Path::from(AGENT_PATH),),
-    );
-
-    result
+    }
 }
 
 fn restart_iwd_service() -> Result<(), String> {
@@ -916,11 +815,10 @@ fn wait_for_network(path_suffix: &str) -> Result<String, String> {
     while Instant::now() < deadline {
         thread::sleep(Duration::from_secs(1));
 
-        let Ok(conn) = Connection::new_system() else {
+        let Ok(conn) = Connection::system() else {
             continue;
         };
-        let proxy = conn.with_proxy(IWD_BUS, "/", DBUS_TIMEOUT);
-        let Ok(objects) = proxy.get_managed_objects() else {
+        let Ok(objects) = get_managed_objects(&conn) else {
             continue;
         };
 
@@ -928,8 +826,9 @@ fn wait_for_network(path_suffix: &str) -> Result<String, String> {
         if !scanned {
             for (path, ifaces) in &objects {
                 if ifaces.contains_key(IWD_STATION) {
-                    let sp = conn.with_proxy(IWD_BUS, path.clone(), DBUS_TIMEOUT);
-                    let _: Result<(), _> = sp.method_call(IWD_STATION, "Scan", ());
+                    if let Ok(sp) = iwd_proxy(&conn, path.as_str(), IWD_STATION) {
+                        let _ = sp.call_method("Scan", &());
+                    }
                     scanned = true;
                     break;
                 }
@@ -954,10 +853,8 @@ fn find_station_path(conn: &Connection) -> Result<String, Box<dyn std::error::Er
 }
 
 fn find_station(conn: &Connection) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let proxy = conn.with_proxy(IWD_BUS, "/", DBUS_TIMEOUT);
-    let objects = proxy
-        .get_managed_objects()
-        .map_err(|_| "iwd service not found on D-Bus. Is iwd running?")?;
+    let objects =
+        get_managed_objects(conn).map_err(|_| "iwd service not found on D-Bus. Is iwd running?")?;
 
     let mut stations: Vec<String> = objects
         .iter()
@@ -973,8 +870,8 @@ fn find_station(conn: &Connection) -> Result<(String, String), Box<dyn std::erro
     // Prefer connected station, else first
     let mut selected = stations[0].clone();
     for path in &stations {
-        let p = conn.with_proxy(IWD_BUS, path.as_str(), DBUS_TIMEOUT);
-        if let Ok(state) = p.get::<String>(IWD_STATION, "State")
+        if let Ok(p) = iwd_proxy(conn, path, IWD_STATION)
+            && let Ok(state) = p.get_property::<String>("State")
             && state == "connected"
         {
             selected.clone_from(path);
@@ -982,9 +879,8 @@ fn find_station(conn: &Connection) -> Result<(String, String), Box<dyn std::erro
         }
     }
 
-    let p = conn.with_proxy(IWD_BUS, selected.as_str(), DBUS_TIMEOUT);
-    let name: String = p
-        .get(IWD_DEVICE, "Name")
+    let name: String = iwd_proxy(conn, &selected, IWD_DEVICE)
+        .and_then(|p| p.get_property("Name"))
         .unwrap_or_else(|_| "unknown".into());
 
     Ok((selected, name))
