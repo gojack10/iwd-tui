@@ -1318,6 +1318,14 @@ fn main() {
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
 
+    // Clear screen on exit
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
+    )
+    .ok();
+
     if let Err(e) = result {
         eprintln!("{e}");
         std::process::exit(1);
