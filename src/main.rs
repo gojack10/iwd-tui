@@ -4,12 +4,14 @@ macro_rules! log {
     };
 }
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use dbus::arg::{RefArg, Variant};
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use dbus::channel::{MatchingReceiver, Sender};
@@ -50,6 +52,8 @@ const IWD_KNOWN_NETWORK: &str = "net.connman.iwd.KnownNetwork";
 const IWD_AGENT_MANAGER: &str = "net.connman.iwd.AgentManager";
 const AGENT_PATH: &str = "/iwdtui/agent";
 const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
+const IWD_STATION_DIAG: &str = "net.connman.iwd.StationDiagnostic";
+const DETAIL_MIN_WIDTH: u16 = 100;
 
 enum ActionResult {
     Scan(Result<(), String>),
@@ -90,6 +94,14 @@ enum Overlay {
     },
 }
 
+struct Diagnostics {
+    rssi: Option<i16>,
+    frequency: Option<u32>,
+    tx_bitrate: Option<u32>,
+    rx_bitrate: Option<u32>,
+    security: Option<String>,
+}
+
 struct App {
     networks: Vec<Network>,
     selected: usize,
@@ -105,6 +117,10 @@ struct App {
     action_rx: mpsc::Receiver<ActionResult>,
     conn: Connection,
     should_quit: bool,
+    diagnostics: Option<Diagnostics>,
+    connected_since: Option<Instant>,
+    detail_autoconnect: Option<bool>,
+    detail_ipv4: Option<String>,
 }
 
 impl App {
@@ -130,6 +146,10 @@ impl App {
             action_rx,
             conn,
             should_quit: false,
+            diagnostics: None,
+            connected_since: None,
+            detail_autoconnect: None,
+            detail_ipv4: None,
         };
         app.refresh_runtime_state()?;
         app.refresh_networks()?;
@@ -183,6 +203,7 @@ impl App {
     }
 
     fn refresh_runtime_state(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let prev_state = self.state.clone();
         let state: String = {
             let proxy = self.conn.with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
             match proxy.get(IWD_STATION, "State") {
@@ -198,6 +219,12 @@ impl App {
             }
         };
         self.state = state.to_uppercase();
+
+        if self.state == "CONNECTED" && prev_state != "CONNECTED" {
+            self.connected_since = Some(Instant::now());
+        } else if self.state != "CONNECTED" {
+            self.connected_since = None;
+        }
 
         let proxy = self.conn.with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
         let scanning = proxy.get::<bool>(IWD_STATION, "Scanning")?;
@@ -216,6 +243,43 @@ impl App {
         self.reconcile_pending_connect();
 
         Ok(())
+    }
+
+    fn refresh_diagnostics(&mut self) {
+        if self.state == "CONNECTED" {
+            let proxy = self.conn.with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
+            let result: Result<(HashMap<String, Variant<Box<dyn RefArg + 'static>>>,), _> =
+                proxy.method_call(IWD_STATION_DIAG, "GetDiagnostics", ());
+            self.diagnostics = match result {
+                Ok((diag,)) => Some(Diagnostics {
+                    rssi: diag.get("RSSI").and_then(|v| v.0.as_i64()).map(|v| v as i16),
+                    frequency: diag.get("Frequency").and_then(|v| v.0.as_u64()).map(|v| v as u32),
+                    tx_bitrate: diag.get("TxBitrate").and_then(|v| v.0.as_u64()).map(|v| v as u32),
+                    rx_bitrate: diag.get("RxBitrate").and_then(|v| v.0.as_u64()).map(|v| v as u32),
+                    security: diag.get("Security").and_then(|v| v.0.as_str()).map(String::from),
+                }),
+                Err(_) => None,
+            };
+        } else {
+            self.diagnostics = None;
+        }
+
+        // AutoConnect for selected network
+        let known_path = self.networks.get(self.selected)
+            .and_then(|n| n.known_path.clone());
+        self.detail_autoconnect = known_path.and_then(|kp| {
+            let proxy = self.conn.with_proxy(IWD_BUS, &*kp, DBUS_TIMEOUT);
+            proxy.get::<bool>(IWD_KNOWN_NETWORK, "AutoConnect").ok()
+        });
+
+        // IPv4 (connected only, cached until disconnect)
+        if self.state == "CONNECTED" {
+            if self.detail_ipv4.is_none() {
+                self.detail_ipv4 = get_masked_ipv4(&self.interface_name);
+            }
+        } else {
+            self.detail_ipv4 = None;
+        }
     }
 
     fn set_error(&mut self, error: impl ToString) {
@@ -819,6 +883,51 @@ fn dbm_color(dbm: i16) -> Color {
     }
 }
 
+fn freq_to_channel(freq_mhz: u32) -> String {
+    if freq_mhz >= 2412 && freq_mhz <= 2484 {
+        if freq_mhz == 2484 {
+            "14".into()
+        } else {
+            format!("{}", (freq_mhz - 2407) / 5)
+        }
+    } else if freq_mhz >= 5170 && freq_mhz <= 5825 {
+        format!("{}", (freq_mhz - 5000) / 5)
+    } else {
+        format!("{freq_mhz} MHz")
+    }
+}
+
+fn format_uptime(since: Instant) -> String {
+    let secs = since.elapsed().as_secs();
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    if hours > 0 {
+        format!("{}h {}m", hours, mins)
+    } else {
+        format!("{}m {}s", mins, secs % 60)
+    }
+}
+
+fn get_masked_ipv4(iface: &str) -> Option<String> {
+    let output = std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show", iface])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let addr = stdout
+        .split_whitespace()
+        .skip_while(|w| *w != "inet")
+        .nth(1)?
+        .split('/')
+        .next()?;
+    let parts: Vec<&str> = addr.split('.').collect();
+    if parts.len() == 4 {
+        Some(format!("{}.{}.███.███", parts[0], parts[1]))
+    } else {
+        None
+    }
+}
+
 fn condense_error(error: &str) -> String {
     error
         .rsplit(": ")
@@ -852,7 +961,29 @@ fn ui(f: &mut Frame, app: &App) {
     .split(f.area());
 
     render_header(f, chunks[0], app);
-    render_list(f, chunks[1], app);
+
+    if f.area().width >= DETAIL_MIN_WIDTH {
+        let block = Block::bordered().border_set(ASCII_BORDER);
+        let inner = block.inner(chunks[1]);
+        f.render_widget(block, chunks[1]);
+
+        let cols = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
+
+        render_list_content(f, cols[0], app);
+
+        let sep: Vec<Line> = (0..cols[1].height).map(|_| Line::from("|")).collect();
+        f.render_widget(Paragraph::new(sep), cols[1]);
+
+        render_detail(f, cols[2], app);
+    } else {
+        render_list(f, chunks[1], app);
+    }
+
     if app.overlay.is_some() {
         render_overlay(f, f.area(), app);
     }
@@ -879,7 +1010,10 @@ fn render_list(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered().border_set(ASCII_BORDER);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    render_list_content(f, inner, app);
+}
 
+fn render_list_content(f: &mut Frame, area: Rect, app: &App) {
     let lines: Vec<Line> = app
         .networks
         .iter()
@@ -910,13 +1044,86 @@ fn render_list(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let visible = inner.height as usize;
+    let visible = area.height as usize;
     let offset = if app.selected >= visible {
         app.selected - visible + 1
     } else {
         0
     };
-    f.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
+    f.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), area);
+}
+
+fn render_detail(f: &mut Frame, area: Rect, app: &App) {
+    let Some(net) = app.selected_network() else {
+        return;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    let name: String = net.name.chars().take(area.width as usize - 10).collect();
+    lines.push(Line::from(format!(" {:9}{}", "NETWORK:", name)));
+
+    if net.connected {
+        lines.push(Line::from(format!(" {:9}{}", "Status:", "CONNECTED")));
+        lines.push(Line::from(format!(" {:9}{}", "Type:", net.net_type)));
+
+        if let Some(ref diag) = app.diagnostics {
+            if let Some(freq) = diag.frequency {
+                let ch = freq_to_channel(freq);
+                let band = if freq >= 5000 { "5 GHz" } else { "2.4 GHz" };
+                lines.push(Line::from(format!(" {:9}{} ({})", "Channel:", ch, band)));
+            }
+            if let Some(rssi) = diag.rssi {
+                lines.push(Line::from(vec![
+                    Span::raw(format!(" {:9}", "RSSI:")),
+                    Span::styled(
+                        format!("{rssi} dBm"),
+                        Style::default().fg(dbm_color(rssi)),
+                    ),
+                ]));
+            }
+            if let Some(tx) = diag.tx_bitrate {
+                lines.push(Line::from(format!(" {:9}{} Mbit/s", "Tx:", tx / 1000)));
+            }
+            if let Some(rx) = diag.rx_bitrate {
+                lines.push(Line::from(format!(" {:9}{} Mbit/s", "Rx:", rx / 1000)));
+            }
+            if let Some(ref sec) = diag.security {
+                lines.push(Line::from(format!(" {:9}{sec}", "Cipher:")));
+            }
+        }
+
+        if let Some(since) = app.connected_since {
+            lines.push(Line::from(format!(" {:9}{}", "Uptime:", format_uptime(since))));
+        }
+        if let Some(ac) = app.detail_autoconnect {
+            lines.push(Line::from(format!(
+                " AutoConnect: {}",
+                if ac { "ON" } else { "OFF" }
+            )));
+        }
+        if let Some(ref ip) = app.detail_ipv4 {
+            lines.push(Line::from(format!(" {:9}{ip}", "IPv4:")));
+        }
+    } else {
+        let status = if net.is_known() { "known" } else { "" };
+        lines.push(Line::from(format!(" {:9}{status}", "Status:")));
+        lines.push(Line::from(format!(" {:9}{}", "Type:", net.net_type)));
+        lines.push(Line::from(vec![
+            Span::raw(format!(" {:9}", "RSSI:")),
+            Span::styled(
+                format!("{} dBm", net.signal_dbm),
+                Style::default().fg(dbm_color(net.signal_dbm)),
+            ),
+        ]));
+        if let Some(ac) = app.detail_autoconnect {
+            lines.push(Line::from(format!(
+                " AutoConnect: {}",
+                if ac { "ON" } else { "OFF" }
+            )));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -1031,6 +1238,7 @@ fn run(
 
         if last_status_refresh.elapsed() >= Duration::from_millis(STATUS_POLL_MS) {
             let _ = app.refresh_runtime_state();
+            app.refresh_diagnostics();
             last_status_refresh = Instant::now();
         }
 
