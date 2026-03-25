@@ -130,6 +130,8 @@ struct App {
     detail_autoconnect: Option<bool>,
     detail_ipv4: Option<String>,
     ethernet: Option<EthernetInfo>,
+    wifi_rx_bytes: u64,
+    wifi_tx_bytes: u64,
 }
 
 impl App {
@@ -160,6 +162,8 @@ impl App {
             detail_autoconnect: None,
             detail_ipv4: None,
             ethernet: None,
+            wifi_rx_bytes: 0,
+            wifi_tx_bytes: 0,
         };
         app.refresh_runtime_state()?;
         app.refresh_networks()?;
@@ -273,6 +277,20 @@ impl App {
             };
         } else {
             self.diagnostics = None;
+        }
+
+        // WiFi byte counters from sysfs
+        if self.state == "CONNECTED" {
+            let base = format!("/sys/class/net/{}/statistics", self.interface_name);
+            self.wifi_rx_bytes = read_sysfs(&format!("{base}/rx_bytes"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            self.wifi_tx_bytes = read_sysfs(&format!("{base}/tx_bytes"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        } else {
+            self.wifi_rx_bytes = 0;
+            self.wifi_tx_bytes = 0;
         }
 
         // AutoConnect for selected network
@@ -1155,10 +1173,14 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(" ETHERNET"));
         lines.push(Line::from(format!(" {:9}{}", "Iface:", eth.interface)));
         if let Some(speed) = eth.speed_mbps {
-            lines.push(Line::from(format!(" {:9}{}", "Speed:", format_speed(speed))));
+            let spd = format_speed(speed);
+            lines.push(Line::from(" Speed"));
+            lines.push(Line::from(format!("   {:7}{}", "Down:", spd)));
+            lines.push(Line::from(format!("   {:7}{}", "Up:", spd)));
         }
-        lines.push(Line::from(format!(" {:9}{}", "Rx:", format_bytes(eth.rx_bytes))));
-        lines.push(Line::from(format!(" {:9}{}", "Tx:", format_bytes(eth.tx_bytes))));
+        lines.push(Line::from(" Data"));
+        lines.push(Line::from(format!("   {:7}{}", "Down:", format_bytes(eth.rx_bytes))));
+        lines.push(Line::from(format!("   {:7}{}", "Up:", format_bytes(eth.tx_bytes))));
         if let Some(ref ip) = eth.ipv4_masked {
             lines.push(Line::from(format!(" {:9}{ip}", "IPv4:")));
         }
@@ -1193,15 +1215,23 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
                     ),
                 ]));
             }
-            if let Some(tx) = diag.tx_bitrate {
-                lines.push(Line::from(format!(" {:9}{} Mbit/s", "Tx:", tx / 1000)));
-            }
-            if let Some(rx) = diag.rx_bitrate {
-                lines.push(Line::from(format!(" {:9}{} Mbit/s", "Rx:", rx / 1000)));
+            if diag.rx_bitrate.is_some() || diag.tx_bitrate.is_some() {
+                lines.push(Line::from(" Speed"));
+                if let Some(rx) = diag.rx_bitrate {
+                    lines.push(Line::from(format!("   {:7}{} Mbit/s", "Down:", rx / 1000)));
+                }
+                if let Some(tx) = diag.tx_bitrate {
+                    lines.push(Line::from(format!("   {:7}{} Mbit/s", "Up:", tx / 1000)));
+                }
             }
             if let Some(ref sec) = diag.security {
                 lines.push(Line::from(format!(" {:9}{sec}", "Cipher:")));
             }
+        }
+        if app.wifi_rx_bytes > 0 || app.wifi_tx_bytes > 0 {
+            lines.push(Line::from(" Data"));
+            lines.push(Line::from(format!("   {:7}{}", "Down:", format_bytes(app.wifi_rx_bytes))));
+            lines.push(Line::from(format!("   {:7}{}", "Up:", format_bytes(app.wifi_tx_bytes))));
         }
 
         if let Some(since) = app.connected_since {
