@@ -5,7 +5,7 @@ macro_rules! log {
 }
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -102,6 +102,14 @@ struct Diagnostics {
     security: Option<String>,
 }
 
+struct EthernetInfo {
+    interface: String,
+    speed_mbps: Option<u32>,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    ipv4_masked: Option<String>,
+}
+
 struct App {
     networks: Vec<Network>,
     selected: usize,
@@ -121,6 +129,7 @@ struct App {
     connected_since: Option<Instant>,
     detail_autoconnect: Option<bool>,
     detail_ipv4: Option<String>,
+    ethernet: Option<EthernetInfo>,
 }
 
 impl App {
@@ -150,9 +159,11 @@ impl App {
             connected_since: None,
             detail_autoconnect: None,
             detail_ipv4: None,
+            ethernet: None,
         };
         app.refresh_runtime_state()?;
         app.refresh_networks()?;
+        app.refresh_ethernet();
         Ok(app)
     }
 
@@ -280,6 +291,55 @@ impl App {
         } else {
             self.detail_ipv4 = None;
         }
+    }
+
+    fn refresh_ethernet(&mut self) {
+        let Ok(entries) = fs::read_dir("/sys/class/net/") else {
+            self.ethernet = None;
+            return;
+        };
+        for entry in entries.flatten() {
+            let iface = entry.file_name().to_string_lossy().to_string();
+            // Skip virtual interfaces
+            if iface == "lo"
+                || iface.starts_with("veth")
+                || iface.starts_with("docker")
+                || iface.starts_with("br-")
+            {
+                continue;
+            }
+            let base = format!("/sys/class/net/{iface}");
+            // Must be ethernet (type 1), not WiFi
+            if read_sysfs(&format!("{base}/type")).as_deref() != Some("1") {
+                continue;
+            }
+            if std::path::Path::new(&format!("{base}/wireless")).exists() {
+                continue;
+            }
+            // Must have carrier (cable in)
+            if read_sysfs(&format!("{base}/carrier")).as_deref() != Some("1") {
+                continue;
+            }
+            let speed_mbps = read_sysfs(&format!("{base}/speed"))
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&s| s > 0 && s < 100_000);
+            let rx_bytes = read_sysfs(&format!("{base}/statistics/rx_bytes"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let tx_bytes = read_sysfs(&format!("{base}/statistics/tx_bytes"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let ipv4_masked = get_masked_ipv4(&iface);
+            self.ethernet = Some(EthernetInfo {
+                interface: iface,
+                speed_mbps,
+                rx_bytes,
+                tx_bytes,
+                ipv4_masked,
+            });
+            return;
+        }
+        self.ethernet = None;
     }
 
     fn set_error(&mut self, error: impl ToString) {
@@ -908,6 +968,33 @@ fn format_uptime(since: Instant) -> String {
     }
 }
 
+fn read_sysfs(path: &str) -> Option<String> {
+    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+fn format_speed(mbps: u32) -> String {
+    if mbps >= 1000 {
+        format!("{}Gbps", mbps / 1000)
+    } else {
+        format!("{}Mbps", mbps)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 fn get_masked_ipv4(iface: &str) -> Option<String> {
     let output = std::process::Command::new("ip")
         .args(["-4", "-o", "addr", "show", iface])
@@ -995,7 +1082,16 @@ fn ui(f: &mut Frame, app: &App) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    let left = format!(" iwd -- {} -- {}", app.interface_name, header_state(app));
+    let state_text = if let Some(ref eth) = app.ethernet {
+        let speed = eth
+            .speed_mbps
+            .map(|s| format_speed(s))
+            .unwrap_or_default();
+        format!("ETHERNET ({} {})", eth.interface, speed)
+    } else {
+        header_state(app)
+    };
+    let left = format!(" iwd -- {} -- {}", app.interface_name, state_text);
     let right = "esc:quit ";
     let gap = (area.width as usize).saturating_sub(left.len() + right.len());
     let header = Line::from(vec![
@@ -1054,6 +1150,22 @@ fn render_list_content(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_detail(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(ref eth) = app.ethernet {
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(" ETHERNET"));
+        lines.push(Line::from(format!(" {:9}{}", "Iface:", eth.interface)));
+        if let Some(speed) = eth.speed_mbps {
+            lines.push(Line::from(format!(" {:9}{}", "Speed:", format_speed(speed))));
+        }
+        lines.push(Line::from(format!(" {:9}{}", "Rx:", format_bytes(eth.rx_bytes))));
+        lines.push(Line::from(format!(" {:9}{}", "Tx:", format_bytes(eth.tx_bytes))));
+        if let Some(ref ip) = eth.ipv4_masked {
+            lines.push(Line::from(format!(" {:9}{ip}", "IPv4:")));
+        }
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
     let Some(net) = app.selected_network() else {
         return;
     };
@@ -1239,6 +1351,7 @@ fn run(
         if last_status_refresh.elapsed() >= Duration::from_millis(STATUS_POLL_MS) {
             let _ = app.refresh_runtime_state();
             app.refresh_diagnostics();
+            app.refresh_ethernet();
             last_status_refresh = Instant::now();
         }
 
