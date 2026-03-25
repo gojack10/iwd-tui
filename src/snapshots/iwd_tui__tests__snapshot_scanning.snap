@@ -1,0 +1,24 @@
+---
+source: src/tests.rs
+expression: "render_to_string(&app, 80, 20)"
+---
+ iwd -- wlan0 -- SCANNING.                                             esc:quit
++------------------------------------------------------------------------------+
+|>  HomeWiFi              ████████▓▒░    -45 dBm   psk   known                 |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
++------------------------------------------------------------------------------+
+ j/k:move  enter:connect  d:disconnect  f:forget  s:scan  a:autoconnect

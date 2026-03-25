@@ -976,7 +976,10 @@ fn freq_to_channel(freq_mhz: u32) -> String {
 }
 
 fn format_uptime(since: Instant) -> String {
-    let secs = since.elapsed().as_secs();
+    format_uptime_secs(since.elapsed().as_secs())
+}
+
+fn format_uptime_secs(secs: u64) -> String {
     let hours = secs / 3600;
     let mins = (secs % 3600) / 60;
     if hours > 0 {
@@ -1326,6 +1329,9 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
         None => {}
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 fn main() {
     // Redirect stderr to log file

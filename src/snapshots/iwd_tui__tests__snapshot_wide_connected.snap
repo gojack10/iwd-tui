@@ -1,0 +1,28 @@
+---
+source: src/tests.rs
+expression: "render_to_string(&app, 120, 24)"
+---
+ iwd -- wlan0 -- CONNECTED                                                                                     esc:quit
++----------------------------------------------------------------------------------------------------------------------+
+|>  HomeWiFi              ████████▓▒░    -45 dBm   psk   CON| NETWORK: HomeWiFi                                        |
+|   CoffeeShop            ████▓▒░        -65 dBm   psk   kno| Status:  CONNECTED                                       |
+|   Neighbor              ███▓▒░         -72 dBm   psk      | Type:    psk                                             |
+|                                                           | Channel: 36 (5 GHz)                                      |
+|                                                           | RSSI:    -45 dBm                                         |
+|                                                           | Speed                                                    |
+|                                                           |   Down:  650 Mbit/s                                      |
+|                                                           |   Up:    866 Mbit/s                                      |
+|                                                           | Cipher:  WPA2-PSK                                        |
+|                                                           | Data                                                     |
+|                                                           |   Down:  150 MB                                          |
+|                                                           |   Up:    25 MB                                           |
+|                                                           | AutoConnect: ON                                          |
+|                                                           | IPv4:    192.168.███.███                                 |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
++----------------------------------------------------------------------------------------------------------------------+
+ j/k:move  enter:connect  d:disconnect  f:forget  s:scan  a:autoconnect

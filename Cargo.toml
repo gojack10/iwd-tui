@@ -11,6 +11,9 @@ dbus-crossroads = "0.5"
 libc = "0.2"
 ratatui = "0.29"
 
+[dev-dependencies]
+insta = "1"
+
 [profile.release]
 opt-level = "z"
 lto = true

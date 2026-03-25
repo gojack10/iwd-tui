@@ -1,0 +1,28 @@
+---
+source: src/tests.rs
+expression: "render_to_string(&app, 120, 24)"
+---
+ iwd -- wlan0 -- ETHERNET (eth0 1Gbps)                                                                         esc:quit
++----------------------------------------------------------------------------------------------------------------------+
+|>  HomeWiFi              ████████▓▒░    -45 dBm   psk   CON| ETHERNET                                                 |
+|                                                           | Iface:   eth0                                            |
+|                                                           | Speed                                                    |
+|                                                           |   Down:  1Gbps                                           |
+|                                                           |   Up:    1Gbps                                           |
+|                                                           | Data                                                     |
+|                                                           |   Down:  500 MB                                          |
+|                                                           |   Up:    50 MB                                           |
+|                                                           | IPv4:    10.0.███.███                                    |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
++----------------------------------------------------------------------------------------------------------------------+
+ j/k:move  enter:connect  d:disconnect  f:forget  s:scan  a:autoconnect
