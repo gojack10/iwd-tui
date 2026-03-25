@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dbus::Message;
 use dbus::arg::{RefArg, Variant};
+
+type DbusProperties = HashMap<String, Variant<Box<dyn RefArg + 'static>>>;
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use dbus::channel::{MatchingReceiver, Sender};
@@ -272,26 +274,26 @@ impl App {
             let proxy = self
                 .conn
                 .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
-            let result: Result<(HashMap<String, Variant<Box<dyn RefArg + 'static>>>,), _> =
+            let result: Result<(DbusProperties,), _> =
                 proxy.method_call(IWD_STATION_DIAG, "GetDiagnostics", ());
             self.diagnostics = match result {
                 Ok((diag,)) => Some(Diagnostics {
                     rssi: diag
                         .get("RSSI")
                         .and_then(|v| v.0.as_i64())
-                        .map(|v| v as i16),
+                        .map(|v| i16::try_from(v).unwrap_or(i16::MIN)),
                     frequency: diag
                         .get("Frequency")
                         .and_then(|v| v.0.as_u64())
-                        .map(|v| v as u32),
+                        .map(|v| u32::try_from(v).unwrap_or(0)),
                     tx_bitrate: diag
                         .get("TxBitrate")
                         .and_then(|v| v.0.as_u64())
-                        .map(|v| v as u32),
+                        .map(|v| u32::try_from(v).unwrap_or(0)),
                     rx_bitrate: diag
                         .get("RxBitrate")
                         .and_then(|v| v.0.as_u64())
-                        .map(|v| v as u32),
+                        .map(|v| u32::try_from(v).unwrap_or(0)),
                     security: diag
                         .get("Security")
                         .and_then(|v| v.0.as_str())
@@ -378,7 +380,7 @@ impl App {
         self.ethernet = None;
     }
 
-    fn set_error(&mut self, error: impl ToString) {
+    fn set_error(&mut self, error: &impl ToString) {
         self.header_error = Some(condense_error(&error.to_string()));
     }
 
@@ -523,7 +525,7 @@ impl App {
             return;
         };
         let Some(ref known_path) = network.known_path else {
-            self.set_error("Not a known network");
+            self.set_error(&"Not a known network");
             return;
         };
         let known_path = known_path.clone();
@@ -583,7 +585,6 @@ impl App {
     fn drain_action_results(&mut self) {
         while let Ok(result) = self.action_rx.try_recv() {
             match result {
-                ActionResult::Scan(Err(e)) => self.set_error(e),
                 ActionResult::Connect {
                     path,
                     result: Err(e),
@@ -591,14 +592,15 @@ impl App {
                     if self.pending_connect_path.as_deref() == Some(&path) {
                         self.pending_connect_path = None;
                     }
-                    self.set_error(e);
+                    self.set_error(&e);
                 }
-                ActionResult::Disconnect(Err(e)) => self.set_error(e),
                 ActionResult::Forget(Ok(())) => {
                     let _ = self.refresh_networks();
                 }
-                ActionResult::Forget(Err(e)) => self.set_error(e),
-                ActionResult::AutoConnect(Err(e)) => self.set_error(e),
+                ActionResult::Scan(Err(e))
+                | ActionResult::Disconnect(Err(e))
+                | ActionResult::Forget(Err(e))
+                | ActionResult::AutoConnect(Err(e)) => self.set_error(&e),
                 _ => {}
             }
         }
@@ -629,7 +631,7 @@ impl App {
             KeyCode::Enter => {
                 self.clear_action_error();
                 if let Err(error) = self.connect_selected() {
-                    self.set_error(error);
+                    self.set_error(&error);
                 }
             }
             KeyCode::Char('d') => {
@@ -645,7 +647,7 @@ impl App {
                             network_name: network.name.clone(),
                         });
                     } else {
-                        self.set_error("Not a known network");
+                        self.set_error(&"Not a known network");
                     }
                 }
             }
@@ -688,13 +690,13 @@ fn agent_connect(network_path: &str, password: &str) -> Result<(), String> {
     agent_connect_once(&new_path, password)
 }
 
-fn agent_connect_once(network_path: &str, password: &str) -> Result<(), String> {
-    log!("agent_connect: opening system bus");
-    let conn = Connection::new_system().map_err(|e| e.to_string())?;
-
-    let connect_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-
-    // Setup agent interface via crossroads
+/// Register a D-Bus agent that responds to IWD passphrase requests,
+/// and install a message receiver that routes calls to it.
+fn setup_agent_receiver(
+    conn: &Connection,
+    password: &str,
+    connect_err: &Arc<Mutex<Option<String>>>,
+) {
     let mut cr = Crossroads::new();
     let iface_token = cr.register("net.connman.iwd.Agent", |b| {
         b.method(
@@ -747,13 +749,10 @@ fn agent_connect_once(network_path: &str, password: &str) -> Result<(), String> 
             true
         }),
     );
+}
 
-    // Find station and set up proxies
-    let station_path = find_station_path(&conn).map_err(|e| e.to_string())?;
-    let station_proxy = conn.with_proxy(IWD_BUS, &*station_path, DBUS_TIMEOUT);
-    let mgr_proxy = conn.with_proxy(IWD_BUS, "/net/connman/iwd", DBUS_TIMEOUT);
-
-    // Disconnect if currently connected
+/// If the station is not disconnected, send Disconnect and poll until it is.
+fn disconnect_if_needed(station_proxy: &dbus::blocking::Proxy<'_, &Connection>) {
     let state: String = station_proxy.get(IWD_STATION, "State").unwrap_or_default();
     if state != "disconnected" {
         log!("agent_connect: disconnecting (state={state})");
@@ -767,6 +766,21 @@ fn agent_connect_once(network_path: &str, password: &str) -> Result<(), String> 
             }
         }
     }
+}
+
+fn agent_connect_once(network_path: &str, password: &str) -> Result<(), String> {
+    log!("agent_connect: opening system bus");
+    let conn = Connection::new_system().map_err(|e| e.to_string())?;
+
+    let connect_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    setup_agent_receiver(&conn, password, &connect_err);
+
+    // Find station and set up proxies
+    let station_path = find_station_path(&conn).map_err(|e| e.to_string())?;
+    let station_proxy = conn.with_proxy(IWD_BUS, &*station_path, DBUS_TIMEOUT);
+    let mgr_proxy = conn.with_proxy(IWD_BUS, "/net/connman/iwd", DBUS_TIMEOUT);
+
+    disconnect_if_needed(&station_proxy);
 
     // Clear stale agent from previous crash, then register fresh
     let _ = mgr_proxy.method_call::<(), _, _, _>(
@@ -902,14 +916,12 @@ fn wait_for_network(path_suffix: &str) -> Result<String, String> {
     while Instant::now() < deadline {
         thread::sleep(Duration::from_secs(1));
 
-        let conn = match Connection::new_system() {
-            Ok(c) => c,
-            Err(_) => continue,
+        let Ok(conn) = Connection::new_system() else {
+            continue;
         };
         let proxy = conn.with_proxy(IWD_BUS, "/", DBUS_TIMEOUT);
-        let objects = match proxy.get_managed_objects() {
-            Ok(o) => o,
-            Err(_) => continue,
+        let Ok(objects) = proxy.get_managed_objects() else {
+            continue;
         };
 
         // Trigger a scan once a station appears
@@ -965,7 +977,7 @@ fn find_station(conn: &Connection) -> Result<(String, String), Box<dyn std::erro
         if let Ok(state) = p.get::<String>(IWD_STATION, "State")
             && state == "connected"
         {
-            selected = path.clone();
+            selected.clone_from(path);
             break;
         }
     }
@@ -979,8 +991,9 @@ fn find_station(conn: &Connection) -> Result<(String, String), Box<dyn std::erro
 }
 
 fn signal_bar(dbm: i16) -> String {
-    let clamped = f32::from(dbm.max(-90).min(-30));
-    let blocks = ((clamped + 90.0) / 6.0).round() as usize;
+    let clamped = f32::from(dbm.clamp(-90, -30));
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let blocks = ((clamped + 90.0) / 6.0).round().max(0.0) as usize;
     let blocks = blocks.min(MAX_BLOCKS);
     let width = blocks + 3;
     let padding = (MAX_BLOCKS + 3).saturating_sub(width);
@@ -1041,6 +1054,7 @@ fn format_speed(mbps: u32) -> String {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -1198,7 +1212,10 @@ fn render_list_content(f: &mut Frame, area: Rect, app: &App) {
 
     let visible = area.height as usize;
     let offset = (app.selected + 1).saturating_sub(visible);
-    f.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), area);
+    f.render_widget(
+        Paragraph::new(lines).scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
+        area,
+    );
 }
 
 fn detail_row(label: &str, val: impl std::fmt::Display) -> Line<'static> {
