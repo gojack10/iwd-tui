@@ -282,12 +282,8 @@ impl App {
         // WiFi byte counters from sysfs
         if self.state == "CONNECTED" {
             let base = format!("/sys/class/net/{}/statistics", self.interface_name);
-            self.wifi_rx_bytes = read_sysfs(&format!("{base}/rx_bytes"))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            self.wifi_tx_bytes = read_sysfs(&format!("{base}/tx_bytes"))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            self.wifi_rx_bytes = read_sysfs_u64(&format!("{base}/rx_bytes"));
+            self.wifi_tx_bytes = read_sysfs_u64(&format!("{base}/tx_bytes"));
         } else {
             self.wifi_rx_bytes = 0;
             self.wifi_tx_bytes = 0;
@@ -341,12 +337,8 @@ impl App {
             let speed_mbps = read_sysfs(&format!("{base}/speed"))
                 .and_then(|s| s.parse::<u32>().ok())
                 .filter(|&s| s > 0 && s < 100_000);
-            let rx_bytes = read_sysfs(&format!("{base}/statistics/rx_bytes"))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let tx_bytes = read_sysfs(&format!("{base}/statistics/tx_bytes"))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let rx_bytes = read_sysfs_u64(&format!("{base}/statistics/rx_bytes"));
+            let tx_bytes = read_sysfs_u64(&format!("{base}/statistics/tx_bytes"));
             let ipv4_masked = get_masked_ipv4(&iface);
             self.ethernet = Some(EthernetInfo {
                 interface: iface,
@@ -391,13 +383,17 @@ impl App {
         network.connected || self.pending_connect_path.is_some()
     }
 
-    fn scan(&mut self) {
+    fn spawn_dbus(&self, path: &str, iface: &'static str, method: &'static str,
+                  wrap: fn(Result<(), String>) -> ActionResult) {
         let tx = self.action_tx.clone();
-        let station_path = self.station_path.clone();
+        let path = path.to_string();
         thread::spawn(move || {
-            let result = dbus_call(&station_path, IWD_STATION, "Scan");
-            let _ = tx.send(ActionResult::Scan(result));
+            let _ = tx.send(wrap(dbus_call(&path, iface, method)));
         });
+    }
+
+    fn scan(&mut self) {
+        self.spawn_dbus(&self.station_path, IWD_STATION, "Scan", ActionResult::Scan);
     }
 
     fn connect_selected(&mut self) -> Result<(), String> {
@@ -437,12 +433,7 @@ impl App {
     }
 
     fn disconnect(&mut self) {
-        let tx = self.action_tx.clone();
-        let station_path = self.station_path.clone();
-        thread::spawn(move || {
-            let result = dbus_call(&station_path, IWD_STATION, "Disconnect");
-            let _ = tx.send(ActionResult::Disconnect(result));
-        });
+        self.spawn_dbus(&self.station_path, IWD_STATION, "Disconnect", ActionResult::Disconnect);
     }
 
     fn agent_connect_selected(&mut self) {
@@ -993,6 +984,10 @@ fn read_sysfs(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
+fn read_sysfs_u64(path: &str) -> u64 {
+    read_sysfs(path).and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
 fn format_speed(mbps: u32) -> String {
     if mbps >= 1000 {
         format!("{}Gbps", mbps / 1000)
@@ -1104,10 +1099,7 @@ fn ui(f: &mut Frame, app: &App) {
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let state_text = if let Some(ref eth) = app.ethernet {
-        let speed = eth
-            .speed_mbps
-            .map(|s| format_speed(s))
-            .unwrap_or_default();
+        let speed = eth.speed_mbps.map(|s| format_speed(s)).unwrap_or_default();
         format!("ETHERNET ({} {})", eth.interface, speed)
     } else {
         header_state(app)
@@ -1147,7 +1139,7 @@ fn render_list_content(f: &mut Frame, area: Rect, app: &App) {
                 ""
             };
 
-            let line = Line::from(vec![
+            Line::from(vec![
                 Span::raw(format!("{cursor}  {ssid:<MAX_SSID$}  ")),
                 Span::raw(format!("{bar} ")),
                 Span::styled(
@@ -1155,37 +1147,39 @@ fn render_list_content(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(dbm_color(net.signal_dbm)),
                 ),
                 Span::raw(format!("   {:<5} {}", net.net_type, status)),
-            ]);
-
-            line
+            ])
         })
         .collect();
 
     let visible = area.height as usize;
-    let offset = if app.selected >= visible {
-        app.selected - visible + 1
-    } else {
-        0
-    };
+    let offset = (app.selected + 1).saturating_sub(visible);
     f.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), area);
+}
+
+fn detail_row(label: &str, val: impl std::fmt::Display) -> Line<'static> {
+    Line::from(format!(" {label:9}{val}"))
+}
+
+fn detail_sub(label: &str, val: impl std::fmt::Display) -> Line<'static> {
+    Line::from(format!("   {label:7}{val}"))
 }
 
 fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     if let Some(ref eth) = app.ethernet {
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(" ETHERNET"));
-        lines.push(Line::from(format!(" {:9}{}", "Iface:", eth.interface)));
+        lines.push(detail_row("Iface:", &eth.interface));
         if let Some(speed) = eth.speed_mbps {
             let spd = format_speed(speed);
             lines.push(Line::from(" Speed"));
-            lines.push(Line::from(format!("   {:7}{}", "Down:", spd)));
-            lines.push(Line::from(format!("   {:7}{}", "Up:", spd)));
+            lines.push(detail_sub("Down:", &spd));
+            lines.push(detail_sub("Up:", &spd));
         }
         lines.push(Line::from(" Data"));
-        lines.push(Line::from(format!("   {:7}{}", "Down:", format_bytes(eth.rx_bytes))));
-        lines.push(Line::from(format!("   {:7}{}", "Up:", format_bytes(eth.tx_bytes))));
+        lines.push(detail_sub("Down:", format_bytes(eth.rx_bytes)));
+        lines.push(detail_sub("Up:", format_bytes(eth.tx_bytes)));
         if let Some(ref ip) = eth.ipv4_masked {
-            lines.push(Line::from(format!(" {:9}{ip}", "IPv4:")));
+            lines.push(detail_row("IPv4:", ip));
         }
         f.render_widget(Paragraph::new(lines), area);
         return;
@@ -1197,74 +1191,62 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     let name: String = net.name.chars().take(area.width as usize - 10).collect();
-    lines.push(Line::from(format!(" {:9}{}", "NETWORK:", name)));
+    lines.push(detail_row("NETWORK:", &name));
 
     if net.connected {
-        lines.push(Line::from(format!(" {:9}{}", "Status:", "CONNECTED")));
-        lines.push(Line::from(format!(" {:9}{}", "Type:", net.net_type)));
+        lines.push(detail_row("Status:", "CONNECTED"));
+        lines.push(detail_row("Type:", &net.net_type));
 
         if let Some(ref diag) = app.diagnostics {
             if let Some(freq) = diag.frequency {
                 let ch = freq_to_channel(freq);
                 let band = if freq >= 5000 { "5 GHz" } else { "2.4 GHz" };
-                lines.push(Line::from(format!(" {:9}{} ({})", "Channel:", ch, band)));
+                lines.push(detail_row("Channel:", format!("{ch} ({band})")));
             }
             if let Some(rssi) = diag.rssi {
                 lines.push(Line::from(vec![
                     Span::raw(format!(" {:9}", "RSSI:")),
-                    Span::styled(
-                        format!("{rssi} dBm"),
-                        Style::default().fg(dbm_color(rssi)),
-                    ),
+                    Span::styled(format!("{rssi} dBm"), Style::default().fg(dbm_color(rssi))),
                 ]));
             }
             if diag.rx_bitrate.is_some() || diag.tx_bitrate.is_some() {
                 lines.push(Line::from(" Speed"));
                 if let Some(rx) = diag.rx_bitrate {
-                    lines.push(Line::from(format!("   {:7}{} Mbit/s", "Down:", rx / 1000)));
+                    lines.push(detail_sub("Down:", format!("{} Mbit/s", rx / 1000)));
                 }
                 if let Some(tx) = diag.tx_bitrate {
-                    lines.push(Line::from(format!("   {:7}{} Mbit/s", "Up:", tx / 1000)));
+                    lines.push(detail_sub("Up:", format!("{} Mbit/s", tx / 1000)));
                 }
             }
             if let Some(ref sec) = diag.security {
-                lines.push(Line::from(format!(" {:9}{sec}", "Cipher:")));
+                lines.push(detail_row("Cipher:", sec));
             }
         }
         if app.wifi_rx_bytes > 0 || app.wifi_tx_bytes > 0 {
             lines.push(Line::from(" Data"));
-            lines.push(Line::from(format!("   {:7}{}", "Down:", format_bytes(app.wifi_rx_bytes))));
-            lines.push(Line::from(format!("   {:7}{}", "Up:", format_bytes(app.wifi_tx_bytes))));
+            lines.push(detail_sub("Down:", format_bytes(app.wifi_rx_bytes)));
+            lines.push(detail_sub("Up:", format_bytes(app.wifi_tx_bytes)));
         }
 
         if let Some(since) = app.connected_since {
-            lines.push(Line::from(format!(" {:9}{}", "Uptime:", format_uptime(since))));
+            lines.push(detail_row("Uptime:", format_uptime(since)));
         }
         if let Some(ac) = app.detail_autoconnect {
-            lines.push(Line::from(format!(
-                " AutoConnect: {}",
-                if ac { "ON" } else { "OFF" }
-            )));
+            lines.push(Line::from(format!(" AutoConnect: {}", if ac { "ON" } else { "OFF" })));
         }
         if let Some(ref ip) = app.detail_ipv4 {
-            lines.push(Line::from(format!(" {:9}{ip}", "IPv4:")));
+            lines.push(detail_row("IPv4:", ip));
         }
     } else {
         let status = if net.is_known() { "known" } else { "" };
-        lines.push(Line::from(format!(" {:9}{status}", "Status:")));
-        lines.push(Line::from(format!(" {:9}{}", "Type:", net.net_type)));
+        lines.push(detail_row("Status:", status));
+        lines.push(detail_row("Type:", &net.net_type));
         lines.push(Line::from(vec![
             Span::raw(format!(" {:9}", "RSSI:")),
-            Span::styled(
-                format!("{} dBm", net.signal_dbm),
-                Style::default().fg(dbm_color(net.signal_dbm)),
-            ),
+            Span::styled(format!("{} dBm", net.signal_dbm), Style::default().fg(dbm_color(net.signal_dbm))),
         ]));
         if let Some(ac) = app.detail_autoconnect {
-            lines.push(Line::from(format!(
-                " AutoConnect: {}",
-                if ac { "ON" } else { "OFF" }
-            )));
+            lines.push(Line::from(format!(" AutoConnect: {}", if ac { "ON" } else { "OFF" })));
         }
     }
 
@@ -1277,54 +1259,36 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
+fn render_modal(f: &mut Frame, area: Rect, w: u16, h: u16, lines: Vec<Line>) {
+    let rect = centered_rect(w, h, area);
+    f.render_widget(ratatui::widgets::Clear, rect);
+    let block = Block::bordered().border_set(ASCII_BORDER);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
     match &app.overlay {
-        Some(Overlay::Password {
-            input,
-            visible,
-            network_name,
-            ..
-        }) => {
-            let rect = centered_rect(42, 7, area);
-            f.render_widget(ratatui::widgets::Clear, rect);
-
+        Some(Overlay::Password { input, visible, network_name, .. }) => {
             let display_name: String = network_name.chars().take(30).collect();
-            let masked: String = if *visible {
-                input.clone()
-            } else {
-                "*".repeat(input.len())
-            };
+            let masked: String = if *visible { input.clone() } else { "*".repeat(input.len()) };
             let pw_display: String = masked.chars().rev().take(28).collect::<String>().chars().rev().collect();
-
-            let block = Block::bordered().border_set(ASCII_BORDER);
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
-
-            let lines = vec![
+            render_modal(f, area, 42, 7, vec![
                 Line::from(format!("  CONNECT: {display_name}")),
                 Line::from(""),
                 Line::from(format!("  Password: {pw_display}_")),
                 Line::from(""),
                 Line::from("  v:show  enter:connect  esc:cancel"),
-            ];
-            f.render_widget(Paragraph::new(lines), inner);
+            ]);
         }
         Some(Overlay::ForgetConfirm { network_name, .. }) => {
-            let rect = centered_rect(42, 5, area);
-            f.render_widget(ratatui::widgets::Clear, rect);
-
             let display_name: String = network_name.chars().take(28).collect();
-
-            let block = Block::bordered().border_set(ASCII_BORDER);
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
-
-            let lines = vec![
+            render_modal(f, area, 42, 5, vec![
                 Line::from(format!("  FORGET: {display_name}?")),
                 Line::from(""),
                 Line::from("  y:confirm  n:cancel"),
-            ];
-            f.render_widget(Paragraph::new(lines), inner);
+            ]);
         }
         None => {}
     }
