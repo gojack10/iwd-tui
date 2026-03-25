@@ -1,5 +1,5 @@
 use super::*;
-use ratatui::{backend::TestBackend, Terminal};
+use ratatui::{Terminal, backend::TestBackend};
 use std::sync::mpsc;
 
 fn net(name: &str, dbm: i16, connected: bool, known: bool) -> Network {
@@ -227,10 +227,7 @@ fn snapshot_ethernet() {
 
 #[test]
 fn snapshot_password_overlay() {
-    let mut app = test_app(
-        vec![net("SecureNet", -55, false, false)],
-        "disconnected",
-    );
+    let mut app = test_app(vec![net("SecureNet", -55, false, false)], "disconnected");
     app.overlay = Some(Overlay::Password {
         input: "secret".into(),
         visible: false,
@@ -242,10 +239,7 @@ fn snapshot_password_overlay() {
 
 #[test]
 fn snapshot_forget_overlay() {
-    let mut app = test_app(
-        vec![net("OldNetwork", -60, false, true)],
-        "disconnected",
-    );
+    let mut app = test_app(vec![net("OldNetwork", -60, false, true)], "disconnected");
     app.overlay = Some(Overlay::ForgetConfirm {
         known_path: "/kn/OldNetwork".into(),
         network_name: "OldNetwork".into(),
@@ -255,20 +249,14 @@ fn snapshot_forget_overlay() {
 
 #[test]
 fn snapshot_scanning() {
-    let mut app = test_app(
-        vec![net("HomeWiFi", -45, false, true)],
-        "disconnected",
-    );
+    let mut app = test_app(vec![net("HomeWiFi", -45, false, true)], "disconnected");
     app.scanning = true;
     insta::assert_snapshot!(render_to_string(&app, 80, 20));
 }
 
 #[test]
 fn snapshot_error() {
-    let mut app = test_app(
-        vec![net("HomeWiFi", -45, false, true)],
-        "disconnected",
-    );
+    let mut app = test_app(vec![net("HomeWiFi", -45, false, true)], "disconnected");
     app.header_error = Some("Connection failed".into());
     insta::assert_snapshot!(render_to_string(&app, 80, 20));
 }

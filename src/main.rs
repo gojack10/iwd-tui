@@ -1,3 +1,5 @@
+#![warn(clippy::pedantic)]
+
 macro_rules! log {
     ($($arg:tt)*) => {
         eprintln!("[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), format!($($arg)*))
@@ -6,17 +8,17 @@ macro_rules! log {
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use dbus::Message;
 use dbus::arg::{RefArg, Variant};
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use dbus::channel::{MatchingReceiver, Sender};
 use dbus::message::MatchRule;
-use dbus::Message;
 use dbus_crossroads::Crossroads;
 use ratatui::{
     Frame,
@@ -220,17 +222,20 @@ impl App {
     fn refresh_runtime_state(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let prev_state = self.state.clone();
         let state: String = {
-            let proxy = self.conn.with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
-            match proxy.get(IWD_STATION, "State") {
-                Ok(s) => s,
-                Err(_) => {
-                    // Station path stale — re-discover (IWD may have restarted)
-                    let (new_path, new_name) = find_station(&self.conn)?;
-                    self.station_path = new_path;
-                    self.interface_name = new_name;
-                    let proxy = self.conn.with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
-                    proxy.get(IWD_STATION, "State")?
-                }
+            let proxy = self
+                .conn
+                .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
+            if let Ok(s) = proxy.get(IWD_STATION, "State") {
+                s
+            } else {
+                // Station path stale — re-discover (IWD may have restarted)
+                let (new_path, new_name) = find_station(&self.conn)?;
+                self.station_path = new_path;
+                self.interface_name = new_name;
+                let proxy = self
+                    .conn
+                    .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
+                proxy.get(IWD_STATION, "State")?
             }
         };
         self.state = state.to_uppercase();
@@ -241,7 +246,9 @@ impl App {
             self.connected_since = None;
         }
 
-        let proxy = self.conn.with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
+        let proxy = self
+            .conn
+            .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
         let scanning = proxy.get::<bool>(IWD_STATION, "Scanning")?;
         if scanning && !self.scanning {
             self.scan_started_at = Some(Instant::now());
@@ -262,16 +269,33 @@ impl App {
 
     fn refresh_diagnostics(&mut self) {
         if self.state == "CONNECTED" {
-            let proxy = self.conn.with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
+            let proxy = self
+                .conn
+                .with_proxy(IWD_BUS, &*self.station_path, DBUS_TIMEOUT);
             let result: Result<(HashMap<String, Variant<Box<dyn RefArg + 'static>>>,), _> =
                 proxy.method_call(IWD_STATION_DIAG, "GetDiagnostics", ());
             self.diagnostics = match result {
                 Ok((diag,)) => Some(Diagnostics {
-                    rssi: diag.get("RSSI").and_then(|v| v.0.as_i64()).map(|v| v as i16),
-                    frequency: diag.get("Frequency").and_then(|v| v.0.as_u64()).map(|v| v as u32),
-                    tx_bitrate: diag.get("TxBitrate").and_then(|v| v.0.as_u64()).map(|v| v as u32),
-                    rx_bitrate: diag.get("RxBitrate").and_then(|v| v.0.as_u64()).map(|v| v as u32),
-                    security: diag.get("Security").and_then(|v| v.0.as_str()).map(String::from),
+                    rssi: diag
+                        .get("RSSI")
+                        .and_then(|v| v.0.as_i64())
+                        .map(|v| v as i16),
+                    frequency: diag
+                        .get("Frequency")
+                        .and_then(|v| v.0.as_u64())
+                        .map(|v| v as u32),
+                    tx_bitrate: diag
+                        .get("TxBitrate")
+                        .and_then(|v| v.0.as_u64())
+                        .map(|v| v as u32),
+                    rx_bitrate: diag
+                        .get("RxBitrate")
+                        .and_then(|v| v.0.as_u64())
+                        .map(|v| v as u32),
+                    security: diag
+                        .get("Security")
+                        .and_then(|v| v.0.as_str())
+                        .map(String::from),
                 }),
                 Err(_) => None,
             };
@@ -290,7 +314,9 @@ impl App {
         }
 
         // AutoConnect for selected network
-        let known_path = self.networks.get(self.selected)
+        let known_path = self
+            .networks
+            .get(self.selected)
             .and_then(|n| n.known_path.clone());
         self.detail_autoconnect = known_path.and_then(|kp| {
             let proxy = self.conn.with_proxy(IWD_BUS, &*kp, DBUS_TIMEOUT);
@@ -383,8 +409,13 @@ impl App {
         network.connected || self.pending_connect_path.is_some()
     }
 
-    fn spawn_dbus(&self, path: &str, iface: &'static str, method: &'static str,
-                  wrap: fn(Result<(), String>) -> ActionResult) {
+    fn spawn_dbus(
+        &self,
+        path: &str,
+        iface: &'static str,
+        method: &'static str,
+        wrap: fn(Result<(), String>) -> ActionResult,
+    ) {
         let tx = self.action_tx.clone();
         let path = path.to_string();
         thread::spawn(move || {
@@ -433,7 +464,12 @@ impl App {
     }
 
     fn disconnect(&mut self) {
-        self.spawn_dbus(&self.station_path, IWD_STATION, "Disconnect", ActionResult::Disconnect);
+        self.spawn_dbus(
+            &self.station_path,
+            IWD_STATION,
+            "Disconnect",
+            ActionResult::Disconnect,
+        );
     }
 
     fn agent_connect_selected(&mut self) {
@@ -450,7 +486,10 @@ impl App {
         };
         let password = input.clone();
         let network_path = network_path.clone();
-        log!("agent_connect_selected: path={network_path} pw_len={}", password.len());
+        log!(
+            "agent_connect_selected: path={network_path} pw_len={}",
+            password.len()
+        );
         self.pending_connect_path = Some(network_path.clone());
         self.overlay = None;
         let tx = self.action_tx.clone();
@@ -465,10 +504,7 @@ impl App {
     }
 
     fn forget_network(&mut self) {
-        let Some(Overlay::ForgetConfirm {
-            ref known_path, ..
-        }) = self.overlay
-        else {
+        let Some(Overlay::ForgetConfirm { ref known_path, .. }) = self.overlay else {
             return;
         };
         let known_path = known_path.clone();
@@ -643,7 +679,9 @@ fn agent_connect(network_path: &str, password: &str) -> Result<(), String> {
     restart_iwd_service()?;
 
     // Wait for IWD to rediscover the network after restart
-    let suffix = network_path.rsplit('/').next()
+    let suffix = network_path
+        .rsplit('/')
+        .next()
         .ok_or_else(|| "Invalid network path".to_string())?;
     let new_path = wait_for_network(suffix)?;
 
@@ -684,13 +722,24 @@ fn agent_connect_once(network_path: &str, password: &str) -> Result<(), String> 
         MatchRule::new(),
         Box::new(move |mut msg, conn| {
             if msg.msg_type() == dbus::MessageType::Error {
-                let err_name = msg.as_result().err()
+                let err_name = msg
+                    .as_result()
+                    .err()
                     .and_then(|e| e.name().map(String::from));
-                log!("agent: recv Error name={:?} items={:?}", err_name, msg.get_items());
+                log!(
+                    "agent: recv Error name={:?} items={:?}",
+                    err_name,
+                    msg.get_items()
+                );
                 *ce.lock().unwrap() = err_name;
             } else {
-                log!("agent: recv {:?} member={:?} path={:?} items={:?}",
-                    msg.msg_type(), msg.member(), msg.path(), msg.get_items());
+                log!(
+                    "agent: recv {:?} member={:?} path={:?} items={:?}",
+                    msg.msg_type(),
+                    msg.member(),
+                    msg.path(),
+                    msg.get_items()
+                );
                 if msg.msg_type() == dbus::MessageType::MethodCall {
                     cr.handle_message(msg, conn).unwrap();
                 }
@@ -737,8 +786,7 @@ fn agent_connect_once(network_path: &str, password: &str) -> Result<(), String> 
 
     // Non-blocking Connect — process() will dispatch RequestPassphrase to crossroads
     log!("agent_connect: sending Connect on {network_path}");
-    let msg = Message::new_method_call(IWD_BUS, network_path, IWD_NETWORK, "Connect")
-        .map_err(|e| e)?;
+    let msg = Message::new_method_call(IWD_BUS, network_path, IWD_NETWORK, "Connect")?;
     conn.send(msg).map_err(|()| "Failed to send Connect")?;
 
     // Flush outgoing queue to ensure Connect is actually on the wire
@@ -758,11 +806,14 @@ fn agent_connect_once(network_path: &str, password: &str) -> Result<(), String> 
         let mut drained = 0u32;
         loop {
             match conn.process(Duration::from_millis(0)) {
-                Ok(true) => { drained += 1; }
+                Ok(true) => {
+                    drained += 1;
+                }
                 Ok(false) => break,
                 Err(e) => {
                     let _ = mgr_proxy.method_call::<(), _, _, _>(
-                        IWD_AGENT_MANAGER, "UnregisterAgent",
+                        IWD_AGENT_MANAGER,
+                        "UnregisterAgent",
                         (dbus::Path::from(AGENT_PATH),),
                     );
                     return Err(format!("D-Bus error: {e}"));
@@ -784,17 +835,13 @@ fn agent_connect_once(network_path: &str, password: &str) -> Result<(), String> 
             break Err(label);
         }
 
-        let connected: bool = target_proxy
-            .get(IWD_NETWORK, "Connected")
-            .unwrap_or(false);
+        let connected: bool = target_proxy.get(IWD_NETWORK, "Connected").unwrap_or(false);
         if connected {
             log!("agent_connect: success");
             break Ok(());
         }
 
-        let state: String = station_proxy
-            .get(IWD_STATION, "State")
-            .unwrap_or_default();
+        let state: String = station_proxy.get(IWD_STATION, "State").unwrap_or_default();
 
         if state == "connecting" && !seen_connecting {
             log!("agent_connect: state=connecting");
@@ -831,21 +878,19 @@ fn restart_iwd_service() -> Result<(), String> {
         .args(["restart", "iwd"])
         .stderr(std::process::Stdio::null())
         .status()
+        && s.success()
     {
-        if s.success() {
-            log!("restart_iwd: success");
-            return Ok(());
-        }
+        log!("restart_iwd: success");
+        return Ok(());
     }
     if let Ok(s) = std::process::Command::new("sudo")
         .args(["-n", "sv", "restart", "iwd"])
         .stderr(std::process::Stdio::null())
         .status()
+        && s.success()
     {
-        if s.success() {
-            log!("restart_iwd: success (sudo)");
-            return Ok(());
-        }
+        log!("restart_iwd: success (sudo)");
+        return Ok(());
     }
     Err("Failed to restart iwd (need root)".into())
 }
@@ -917,11 +962,11 @@ fn find_station(conn: &Connection) -> Result<(String, String), Box<dyn std::erro
     let mut selected = stations[0].clone();
     for path in &stations {
         let p = conn.with_proxy(IWD_BUS, path.as_str(), DBUS_TIMEOUT);
-        if let Ok(state) = p.get::<String>(IWD_STATION, "State") {
-            if state == "connected" {
-                selected = path.clone();
-                break;
-            }
+        if let Ok(state) = p.get::<String>(IWD_STATION, "State")
+            && state == "connected"
+        {
+            selected = path.clone();
+            break;
         }
     }
 
@@ -934,7 +979,7 @@ fn find_station(conn: &Connection) -> Result<(String, String), Box<dyn std::erro
 }
 
 fn signal_bar(dbm: i16) -> String {
-    let clamped = dbm.max(-90).min(-30) as f32;
+    let clamped = f32::from(dbm.max(-90).min(-30));
     let blocks = ((clamped + 90.0) / 6.0).round() as usize;
     let blocks = blocks.min(MAX_BLOCKS);
     let width = blocks + 3;
@@ -953,13 +998,13 @@ fn dbm_color(dbm: i16) -> Color {
 }
 
 fn freq_to_channel(freq_mhz: u32) -> String {
-    if freq_mhz >= 2412 && freq_mhz <= 2484 {
+    if (2412..=2484).contains(&freq_mhz) {
         if freq_mhz == 2484 {
             "14".into()
         } else {
             format!("{}", (freq_mhz - 2407) / 5)
         }
-    } else if freq_mhz >= 5170 && freq_mhz <= 5825 {
+    } else if (5170..=5825).contains(&freq_mhz) {
         format!("{}", (freq_mhz - 5000) / 5)
     } else {
         format!("{freq_mhz} MHz")
@@ -974,7 +1019,7 @@ fn format_uptime_secs(secs: u64) -> String {
     let hours = secs / 3600;
     let mins = (secs % 3600) / 60;
     if hours > 0 {
-        format!("{}h {}m", hours, mins)
+        format!("{hours}h {mins}m")
     } else {
         format!("{}m {}s", mins, secs % 60)
     }
@@ -992,7 +1037,7 @@ fn format_speed(mbps: u32) -> String {
     if mbps >= 1000 {
         format!("{}Gbps", mbps / 1000)
     } else {
-        format!("{}Mbps", mbps)
+        format!("{mbps}Mbps")
     }
 }
 
@@ -1007,7 +1052,7 @@ fn format_bytes(bytes: u64) -> String {
     } else if bytes >= KB {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 
@@ -1099,7 +1144,7 @@ fn ui(f: &mut Frame, app: &App) {
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let state_text = if let Some(ref eth) = app.ethernet {
-        let speed = eth.speed_mbps.map(|s| format_speed(s)).unwrap_or_default();
+        let speed = eth.speed_mbps.map(format_speed).unwrap_or_default();
         format!("ETHERNET ({} {})", eth.interface, speed)
     } else {
         header_state(app)
@@ -1232,7 +1277,10 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
             lines.push(detail_row("Uptime:", format_uptime(since)));
         }
         if let Some(ac) = app.detail_autoconnect {
-            lines.push(Line::from(format!(" AutoConnect: {}", if ac { "ON" } else { "OFF" })));
+            lines.push(Line::from(format!(
+                " AutoConnect: {}",
+                if ac { "ON" } else { "OFF" }
+            )));
         }
         if let Some(ref ip) = app.detail_ipv4 {
             lines.push(detail_row("IPv4:", ip));
@@ -1243,10 +1291,16 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
         lines.push(detail_row("Type:", &net.net_type));
         lines.push(Line::from(vec![
             Span::raw(format!(" {:9}", "RSSI:")),
-            Span::styled(format!("{} dBm", net.signal_dbm), Style::default().fg(dbm_color(net.signal_dbm))),
+            Span::styled(
+                format!("{} dBm", net.signal_dbm),
+                Style::default().fg(dbm_color(net.signal_dbm)),
+            ),
         ]));
         if let Some(ac) = app.detail_autoconnect {
-            lines.push(Line::from(format!(" AutoConnect: {}", if ac { "ON" } else { "OFF" })));
+            lines.push(Line::from(format!(
+                " AutoConnect: {}",
+                if ac { "ON" } else { "OFF" }
+            )));
         }
     }
 
@@ -1270,25 +1324,53 @@ fn render_modal(f: &mut Frame, area: Rect, w: u16, h: u16, lines: Vec<Line>) {
 
 fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
     match &app.overlay {
-        Some(Overlay::Password { input, visible, network_name, .. }) => {
+        Some(Overlay::Password {
+            input,
+            visible,
+            network_name,
+            ..
+        }) => {
             let display_name: String = network_name.chars().take(30).collect();
-            let masked: String = if *visible { input.clone() } else { "*".repeat(input.len()) };
-            let pw_display: String = masked.chars().rev().take(28).collect::<String>().chars().rev().collect();
-            render_modal(f, area, 42, 7, vec![
-                Line::from(format!("  CONNECT: {display_name}")),
-                Line::from(""),
-                Line::from(format!("  Password: {pw_display}_")),
-                Line::from(""),
-                Line::from("  v:show  enter:connect  esc:cancel"),
-            ]);
+            let masked: String = if *visible {
+                input.clone()
+            } else {
+                "*".repeat(input.len())
+            };
+            let pw_display: String = masked
+                .chars()
+                .rev()
+                .take(28)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            render_modal(
+                f,
+                area,
+                42,
+                7,
+                vec![
+                    Line::from(format!("  CONNECT: {display_name}")),
+                    Line::from(""),
+                    Line::from(format!("  Password: {pw_display}_")),
+                    Line::from(""),
+                    Line::from("  v:show  enter:connect  esc:cancel"),
+                ],
+            );
         }
         Some(Overlay::ForgetConfirm { network_name, .. }) => {
             let display_name: String = network_name.chars().take(28).collect();
-            render_modal(f, area, 42, 5, vec![
-                Line::from(format!("  FORGET: {display_name}?")),
-                Line::from(""),
-                Line::from("  y:confirm  n:cancel"),
-            ]);
+            render_modal(
+                f,
+                area,
+                42,
+                5,
+                vec![
+                    Line::from(format!("  FORGET: {display_name}?")),
+                    Line::from(""),
+                    Line::from("  y:confirm  n:cancel"),
+                ],
+            );
         }
         None => {}
     }
@@ -1300,8 +1382,14 @@ mod tests;
 fn main() {
     // Redirect stderr to log file
     use std::os::unix::io::AsRawFd;
-    if let Ok(f) = OpenOptions::new().create(true).append(true).open("/tmp/iwd-tui.log") {
-        unsafe { libc::dup2(f.as_raw_fd(), 2); }
+    if let Ok(f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/iwd-tui.log")
+    {
+        unsafe {
+            libc::dup2(f.as_raw_fd(), 2);
+        }
     }
     log!("starting iwd-tui");
 
@@ -1342,12 +1430,11 @@ fn run(
     loop {
         terminal.draw(|f| ui(f, app))?;
 
-        if event::poll(Duration::from_millis(POLL_MS))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key(key.code);
-                }
-            }
+        if event::poll(Duration::from_millis(POLL_MS))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            app.handle_key(key.code);
         }
 
         if app.should_quit {
